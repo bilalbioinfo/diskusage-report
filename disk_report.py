@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """
-disk_report.py -- scan a directory tree and write an HTML report of who owns
-the storage, based on the owner (uid) of every file.
+Author: Bilal Sharif <bilal.bioinfo@gmail.com>
 
-    python3 disk_report.py /path/to/project
+Description: scan a directory tree and write an HTML report of who owns the storage.
+Usage: python3 disk_report.py /path/to/project
 
-Writes two files into the current directory (override with -o):
-
-    diskusage_<name>_<date>.html   the report
-    diskusage_<name>_<date>.json   the aggregated scan, so the report can be
-                                   rebuilt without rescanning:
-                                   python3 disk_report.py --from-json <file>.json
-
-Sizes are on-disk usage (st_blocks * 512, like `du` and ncdu's dsize).
-Hard-linked files are counted once. Symlinks are not followed and, by default,
-other filesystems mounted inside the tree are skipped (like `du -x`).
-
-Standard library only; Python >= 3.6.
+Writes two files into the current directory
+diskusage_<name>_<date>.html: the report
+diskusage_<name>_<date>.json: the aggregated scan, so the report can be rebuilt without rescanning: python3 disk_report.py --from-json <file>.json
 """
 import argparse
 import datetime
