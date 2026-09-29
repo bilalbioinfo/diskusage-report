@@ -1,0 +1,6 @@
+# generated reports (they contain usernames and paths)
+diskusage_*.html
+diskusage_*.json
+
+__pycache__/
+*.pyc
