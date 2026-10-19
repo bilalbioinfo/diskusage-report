@@ -32,3 +32,11 @@ python3 disk_report.py --from-json diskusage_<name>_<date>.json
 | `--depth` | 3 | How many folder levels deep the folder table goes |
 | `--cross-filesystems` | off | Also scan other filesystems mounted inside the directory |
 | `--from-json FILE` | | Rebuild the report from a saved scan |
+| `--days` | 7 | Also report data modified in the last this many days |
+
+## Recently modified data
+
+The report shows how much data was modified in the last `--days` days and which
+folders and owners it is in. The top ten folders are also printed in the
+terminal.
+

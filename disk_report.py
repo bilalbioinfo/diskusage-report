@@ -32,15 +32,17 @@ MAX_ERRORS_KEPT = 500
 # scanning
 # --------------------------------------------------------------------------
 
-def scan_task(root, rel, root_dev, depth, cross_fs):
+def scan_task(root, rel, root_dev, depth, cross_fs, since):
     """Scan the directory `rel` (relative to `root`) and as much below it as
     fits in ENTRIES_PER_TASK. Runs in a worker process.
 
     Returns (usage, hardlinks, errors, leftover_dirs, n_entries, n_dirs):
-      usage     {(folder_key, uid): [bytes, files]} where folder_key is the
-                containing directory truncated to `depth` levels
-      hardlinks [(dev, ino, folder_key, uid, bytes)] for files with nlink > 1,
-                de-duplicated by the parent process
+      usage     {(folder_key, uid): [bytes, files, recent_bytes, recent_files]}
+                where folder_key is the containing directory truncated to
+                `depth` levels and recent means a file modified at or after
+                `since` (moving a file keeps its modification time)
+      hardlinks [(dev, ino, folder_key, uid, bytes, recent)] for files with
+                nlink > 1, de-duplicated by the parent process
       errors    [(rel_path, message)]
     """
     usage = {}
@@ -75,16 +77,19 @@ def scan_task(root, rel, root_dev, depth, cross_fs):
                         todo.append(cur + "/" + entry.name if cur else entry.name)
                     n_entries += 1
                     size = st.st_blocks * 512
+                    recent = st.st_mtime >= since
                     if not is_dir and st.st_nlink > 1:
-                        hardlinks.append((st.st_dev, st.st_ino, key, st.st_uid, size))
+                        hardlinks.append((st.st_dev, st.st_ino, key, st.st_uid, size, recent))
                         continue
                     slot = usage.get((key, st.st_uid))
                     if slot is None:
-                        usage[(key, st.st_uid)] = [size, 0 if is_dir else 1]
-                    else:
-                        slot[0] += size
-                        if not is_dir:
-                            slot[1] += 1
+                        slot = usage[(key, st.st_uid)] = [0, 0, 0, 0]
+                    slot[0] += size
+                    if not is_dir:
+                        slot[1] += 1
+                        if recent:
+                            slot[2] += size
+                            slot[3] += 1
         except OSError as e:
             errors.append((cur, e.strerror or str(e)))
         if n_entries >= ENTRIES_PER_TASK and todo:
@@ -105,10 +110,11 @@ def fmt_duration(s):
     return "%d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
 
 
-def scan(root, workers, depth, cross_fs):
+def scan(root, workers, depth, cross_fs, since):
     root_st = os.stat(root)
     root_dev = root_st.st_dev
-    usage = {("", root_st.st_uid): [root_st.st_blocks * 512, 0]}  # (folder_key, uid) -> [bytes, files]
+    # (folder_key, uid) -> [bytes, files, recent_bytes, recent_files]
+    usage = {("", root_st.st_uid): [root_st.st_blocks * 512, 0, 0, 0]}
     seen_inodes = set()
     errors = []
     n_errors = 0
@@ -119,30 +125,32 @@ def scan(root, workers, depth, cross_fs):
     t0 = last = time.time()
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        pending = {pool.submit(scan_task, root, "", root_dev, depth, cross_fs)}
+        pending = {pool.submit(scan_task, root, "", root_dev, depth, cross_fs, since)}
         while pending:
             done, pending = wait(pending, timeout=PROGRESS_EVERY_S, return_when=FIRST_COMPLETED)
             for fut in done:
                 u, hl, errs, leftover, ne, nd = fut.result()
-                for k, (b, f) in u.items():
-                    total_bytes += b
+                for k, v in u.items():
+                    total_bytes += v[0]
                     slot = usage.get(k)
                     if slot is None:
-                        usage[k] = [b, f]
+                        usage[k] = v
                     else:
-                        slot[0] += b
-                        slot[1] += f
-                for dev, ino, key, uid, b in hl:
+                        for i in range(4):
+                            slot[i] += v[i]
+                for dev, ino, key, uid, b, recent in hl:
                     if (dev, ino) in seen_inodes:
                         continue
                     seen_inodes.add((dev, ino))
                     total_bytes += b
                     slot = usage.get((key, uid))
                     if slot is None:
-                        usage[(key, uid)] = [b, 1]
-                    else:
-                        slot[0] += b
-                        slot[1] += 1
+                        slot = usage[(key, uid)] = [0, 0, 0, 0]
+                    slot[0] += b
+                    slot[1] += 1
+                    if recent:
+                        slot[2] += b
+                        slot[3] += 1
                 for p, msg in errs:
                     n_errors += 1
                     top = p.split("/")[0] if p else "."
@@ -152,7 +160,7 @@ def scan(root, workers, depth, cross_fs):
                 n_entries += ne
                 n_dirs += nd
                 for d in leftover:
-                    pending.add(pool.submit(scan_task, root, d, root_dev, depth, cross_fs))
+                    pending.add(pool.submit(scan_task, root, d, root_dev, depth, cross_fs, since))
             now = time.time()
             if now - last >= PROGRESS_EVERY_S:
                 last = now
@@ -181,25 +189,33 @@ def owner_info(uid):
         return "uid %d" % uid, ""
 
 
-def to_saved(root, result, workers, depth, cross_fs):
+def to_saved(root, result, workers, depth, cross_fs, days, since):
     """Aggregate raw scan results into the JSON that gets saved and that the
     report is built from. Folder sizes are cumulative (a folder includes
-    everything below it) for every folder up to `depth` levels deep."""
+    everything below it) for every folder up to `depth` levels deep.
+    `recent` is the same for files modified in the last `days` days."""
     owners = {}
     folders = {}
+    recent = {}
     uid_names = {}
-    for (key, uid), (b, f) in result["usage"].items():
+    for (key, uid), (b, f, rb, rf) in result["usage"].items():
         if uid not in uid_names:
             uid_names[uid] = owner_info(uid)
         name, full = uid_names[uid]
-        o = owners.setdefault(name, {"uid": uid, "full_name": full, "bytes": 0, "files": 0})
+        o = owners.setdefault(name, {"uid": uid, "full_name": full, "bytes": 0, "files": 0,
+                                     "recent_bytes": 0, "recent_files": 0})
         o["bytes"] += b
         o["files"] += f
+        o["recent_bytes"] += rb
+        o["recent_files"] += rf
         parts = key.split("/") if key else []
         for i in range(len(parts) + 1):
             p = "/".join(parts[:i])
             d = folders.setdefault(p, {})
             d[name] = d.get(name, 0) + b
+            if rb:
+                d = recent.setdefault(p, {})
+                d[name] = d.get(name, 0) + rb
 
     return {
         "meta": {
@@ -213,9 +229,12 @@ def to_saved(root, result, workers, depth, cross_fs):
             "entries": result["n_entries"],
             "dirs": result["n_dirs"],
             "n_errors": result["n_errors"],
+            "recent_days": days,
+            "recent_since": datetime.datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M"),
         },
         "owners": owners,
         "folders": folders,
+        "recent": recent,
         "error_top": result["error_top"],
         "errors": result["errors"],
     }
@@ -229,6 +248,7 @@ TOP_FOLDERS = 15        # bars in the top-level folder chart, rest rolled up
 COLORED_OWNERS = 8      # owners with their own color; the rest are "other"
 LARGEST_FOLDERS = 30    # deepest-level folders in the "largest folders" table
 HOTSPOT_SHARE = 0.5     # descend while one subfolder holds >= this share
+RECENT_ROWS = 25        # deepest-level folders in the "recently modified" table
 
 
 def build_report_data(saved):
@@ -335,8 +355,61 @@ def build_report_data(saved):
     }
 
 
+def build_recent(saved):
+    """Where the data modified in the last `recent_days` days lives. Built from
+    file modification times, so data that was only moved keeps its old date
+    and is not counted. None for scans saved before this was tracked."""
+    recent = saved.get("recent")
+    if recent is None:
+        return None
+    folders = saved["folders"]
+    children = {}
+    for p in recent:
+        if p:
+            children.setdefault(p.rsplit("/", 1)[0] if "/" in p else "", []).append(p)
+
+    def total(p):
+        return sum(recent.get(p, {}).values())
+
+    def row(p):
+        owners = sorted(({"owner": n, "bytes": b} for n, b in recent[p].items()), key=lambda x: -x["bytes"])
+        return {"path": p, "bytes": total(p), "folder_bytes": sum(folders.get(p, {}).values()), "owners": owners}
+
+    # Walk down while one subfolder holds most of the recent data.
+    trail = []
+    node = ""
+    node_b = total("")
+    while node_b > 0:
+        best = max(children.get(node, []), key=total, default=None)
+        if best is None or total(best) < HOTSPOT_SHARE * node_b:
+            break
+        node, node_b = best, total(best)
+        trail.append(row(node))
+
+    top = sorted(children.get("", []), key=lambda p: -total(p))
+    leaves = sorted((p for p in recent if p and p not in children), key=lambda p: -total(p))
+    return {
+        "days": saved["meta"]["recent_days"],
+        "since": saved["meta"]["recent_since"],
+        "bytes": total(""),
+        "files": sum(o["recent_files"] for o in saved["owners"].values()),
+        "trail": trail,
+        "top": [row(p) for p in top[:TOP_FOLDERS]],
+        "leaves": [row(p) for p in leaves[:RECENT_ROWS]],
+        "owners": {n: o["recent_bytes"] for n, o in saved["owners"].items()},
+    }
+
+
+def print_recent(r):
+    sys.stdout.write("Modified in the last %s days (since %s): %s in %s files\n" % (
+        r["days"], r["since"], fmt_bytes(r["bytes"]), format(r["files"], ",")))
+    for x in r["leaves"][:10]:
+        sys.stdout.write("  %-10s %s  (%s)\n" % (fmt_bytes(x["bytes"]), x["path"], x["owners"][0]["owner"]))
+
+
 def render_html(saved):
     data = build_report_data(saved)
+    data["recent"] = build_recent(saved)
     name = os.path.basename(saved["meta"]["root"].rstrip("/")) or saved["meta"]["root"]
     payload = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
     return (HTML_TEMPLATE
@@ -527,6 +600,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     <details class="tbl"><summary>Show as table</summary><div class="table-wrap" id="table-folders"></div></details>
   </div>
 
+  <div class="card" id="card-recent" hidden>
+    <h2 id="recent-title"></h2>
+    <p class="desc" id="desc-recent"></p>
+    <div class="table-wrap" id="table-recent-leaves"></div>
+    <details class="tbl"><summary>By top-level folder</summary><div class="table-wrap" id="table-recent-top"></div></details>
+  </div>
+
   <div class="card">
     <h2>Largest folders</h2>
     <p class="desc" id="desc-largest"></p>
@@ -672,7 +752,9 @@ function tileValue(id, text) {
   if (m && m[2]) node.appendChild(el('span', 'unit', m[2]));
 }
 tileValue('tile-total', fmtBytes(M.total_bytes));
-document.getElementById('tile-total-sub').textContent = 'in ' + fmtInt(M.n_top_folders) + ' top-level folders';
+const R = DATA.recent;
+document.getElementById('tile-total-sub').textContent = 'in ' + fmtInt(M.n_top_folders) + ' top-level folders' +
+  (R ? ', ' + fmtBytes(R.bytes) + ' modified in the last ' + R.days + ' days' : '');
 tileValue('tile-files', fmtInt(M.files));
 document.getElementById('tile-files-sub').textContent = fmtInt(M.dirs) + ' folders';
 tileValue('tile-owners', fmtInt(M.n_owners));
@@ -690,7 +772,31 @@ table(document.getElementById('table-owners'), [
   { h: 'Used', v: o => fmtBytes(o.bytes) },
   { h: 'Share', v: o => pct(o.bytes, M.total_bytes) + '%' },
   { h: 'Files', v: o => fmtInt(o.files) },
-], owners);
+].concat(R ? [{ h: 'Last ' + R.days + ' days', v: o => fmtBytes(R.owners[o.name] || 0) }] : []), owners);
+
+// ---- recently modified data ----
+if (R) {
+  document.getElementById('card-recent').hidden = false;
+  document.getElementById('recent-title').textContent = 'Modified in the last ' + R.days + ' days: ' + fmtBytes(R.bytes);
+  let desc = fmtBytes(R.bytes) + ' in ' + fmtInt(R.files) + ' files was written or changed since ' + R.since + ' (' +
+    pct(R.bytes, M.total_bytes) + '% of the total). ';
+  if (R.trail.length) {
+    const h = R.trail[R.trail.length - 1];
+    desc += 'Most of it is in ' + h.path + ' (' + fmtBytes(h.bytes) + ', ' + pct(h.bytes, R.bytes) + '%)' +
+      ', mainly from ' + h.owners[0].owner + '. ';
+  }
+  document.getElementById('desc-recent').textContent = desc.trim();
+  const cols = [
+    { h: 'Recent', v: r => fmtBytes(r.bytes) },
+    { h: 'Folder total', v: r => fmtBytes(r.folder_bytes) },
+    { h: 'Recent share', v: r => shareBar(pct(r.bytes, r.folder_bytes)) },
+    { h: 'Mostly by', cls: 'l', v: r => r.owners[0].owner + ' ' + fmtBytes(r.owners[0].bytes) },
+  ];
+  table(document.getElementById('table-recent-leaves'),
+    [{ h: 'Folder', cls: 'l path', v: r => r.path }].concat(cols), R.leaves);
+  table(document.getElementById('table-recent-top'),
+    [{ h: 'Folder', cls: 'l path', v: r => r.path }].concat(cols), R.top);
+}
 
 // ---- top-level folders, stacked by owner ----
 document.getElementById('desc-folders').textContent =
@@ -781,12 +887,17 @@ def main():
                     help="also scan other filesystems mounted inside the tree")
     ap.add_argument("--from-json", metavar="FILE",
                     help="rebuild the HTML from a saved JSON scan instead of scanning")
+    ap.add_argument("--days", type=float, default=7,
+                    help="also report data modified in the last DAYS days (default: %(default)g)")
     args = ap.parse_args()
 
     if args.from_json:
         with open(args.from_json) as fh:
             saved = json.load(fh)
         out_html = args.output or os.path.splitext(args.from_json)[0] + ".html"
+        recent = build_recent(saved)
+        if recent:
+            print_recent(recent)
         with open(out_html, "w") as fh:
             fh.write(render_html(saved))
         print("Wrote", out_html)
@@ -803,8 +914,9 @@ def main():
     out_json = os.path.splitext(out_html)[0] + ".json"
 
     sys.stderr.write("Scanning %s with %d workers (progress every %ds)\n" % (root, args.workers, PROGRESS_EVERY_S))
-    result = scan(root, args.workers, args.depth, args.cross_filesystems)
-    saved = to_saved(root, result, args.workers, args.depth, args.cross_filesystems)
+    since = time.time() - args.days * 86400
+    result = scan(root, args.workers, args.depth, args.cross_filesystems, since)
+    saved = to_saved(root, result, args.workers, args.depth, args.cross_filesystems, args.days, since)
 
     with open(out_json, "w") as fh:
         json.dump(saved, fh)
@@ -815,6 +927,7 @@ def main():
     print("Scanned %s entries in %s: %s, %d owners, %d unreadable paths" % (
         format(result["n_entries"], ","), fmt_duration(result["duration_s"]),
         fmt_bytes(total), len(saved["owners"]), result["n_errors"]))
+    print_recent(build_recent(saved))
     print("Wrote", out_html)
     print("Wrote", out_json)
 
